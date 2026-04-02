@@ -81,15 +81,15 @@ LAYER_STRUCTURE   = 4
 LAYER_VEHICLE     = 5
 LAYER_PERSON      = 6
 
-# BGR colors for each layer
+# BGR colors for each layer  (B, G, R)
 LAYER_COLORS = {
-    LAYER_UNKNOWN:     (  20,  20,  20),   # near-black
-    LAYER_TRAVERSABLE: ( 180,  90,   0),   # blue (road/floor)
-    LAYER_VEGETATION:  (  30, 130,  30),   # dark green
-    LAYER_FURNITURE:   ( 130,  30, 130),   # purple
-    LAYER_STRUCTURE:   (  40,  40, 160),   # dark red
-    LAYER_VEHICLE:     (   0, 200, 220),   # yellow
-    LAYER_PERSON:      ( 220, 220,   0),   # cyan
+    LAYER_UNKNOWN:     (   0,   0,   0),   # black
+    LAYER_TRAVERSABLE: ( 230, 100,   0),   # blue  — road / floor
+    LAYER_VEGETATION:  (   0, 170,   0),   # green — trees / grass
+    LAYER_FURNITURE:   ( 200,   0, 200),   # magenta — indoor obstacles
+    LAYER_STRUCTURE:   (  22,  22,  22),   # near-black — walls / buildings
+    LAYER_VEHICLE:     (   0, 230, 230),   # yellow — cars
+    LAYER_PERSON:      ( 255, 255,   0),   # cyan — people
 }
 
 # ADE20K class index → layer (unlisted = UNKNOWN → not painted)
@@ -161,7 +161,41 @@ def _circle_kernel(r):
     cv2.circle(k, (r, r), r, 1, -1)
     return k
 
-_INF_KERNEL = _circle_kernel(ROBOT_CELLS)
+_INF_KERNEL  = _circle_kernel(ROBOT_CELLS)
+_FILL_KERNEL = np.ones((5, 5), np.uint8)   # morphological close for gap filling
+
+# FOV frustum mask — built lazily after calibration is finalised
+_fov_mask: np.ndarray | None = None
+
+
+def _build_fov_mask() -> np.ndarray:
+    """
+    Returns a (BEV_H, BEV_W) bool mask that is True only inside the
+    camera's visible frustum (trapezoid: narrow near, wide far).
+    """
+    def _row(z):
+        return int(np.clip(BEV_H - 1 - (z - BEV_Z_MIN_MM) / CELL_MM, 0, BEV_H - 1))
+
+    def _col(x):
+        return int(np.clip((x + BEV_X_MM) / CELL_MM, 0, BEV_W - 1))
+
+    # X world-coordinate of left / right image edge at depth z:
+    #   x_left  =  cx * z / fx   (pixel u=0    → +X direction)
+    #   x_right = -(W-1-cx) * z / fx   (pixel u=W-1 → −X direction)
+    def _x_left(z):  return  CAL['cx']           * z / CAL['fx']
+    def _x_right(z): return -(RGB_W - 1 - CAL['cx']) * z / CAL['fx']
+
+    poly = np.array([
+        [_col(_x_left(BEV_Z_MIN_MM)),  _row(BEV_Z_MIN_MM)],   # near-left
+        [_col(_x_right(BEV_Z_MIN_MM)), _row(BEV_Z_MIN_MM)],   # near-right
+        [_col(_x_right(BEV_Z_MAX_MM)), _row(BEV_Z_MAX_MM)],   # far-right
+        [_col(_x_left(BEV_Z_MAX_MM)),  _row(BEV_Z_MAX_MM)],   # far-left
+    ], dtype=np.int32)
+
+    m = np.zeros((BEV_H, BEV_W), np.uint8)
+    cv2.fillPoly(m, [poly], 1)
+    return m.astype(bool)
+
 
 # Jet LUT
 _LUT = cv2.applyColorMap(np.arange(256, dtype=np.uint8), cv2.COLORMAP_JET)
@@ -290,15 +324,23 @@ def update_bev_semantic(depth_mm: np.ndarray,
     seg_flat = np.clip(seg_flat, 0, 149)
     layers   = _ADE_LUT[seg_flat]
 
-    # Sort by depth (far → near) so near points overwrite far ones
-    order = np.argsort(-z_g)
-    col, row, layers, y_g = col[order], row[order], layers[order], y_g[order]
+    # Y-based fallback for pixels the seg model left as UNKNOWN:
+    #   below floor threshold  → TRAVERSABLE
+    #   above floor threshold  → STRUCTURE (generic obstacle)
+    unknown = layers == LAYER_UNKNOWN
+    layers[unknown & (y_g < FLOOR_Y_MM)]  = LAYER_TRAVERSABLE
+    layers[unknown & (y_g >= FLOOR_Y_MM)] = LAYER_STRUCTURE
 
-    # Paint: higher priority layers overwrite lower ones
-    current_layers = _bev_layer[row, col]
+    # Sort far → near so nearer points overwrite stale far ones
+    order = np.argsort(-z_g)
+    col, row, layers = col[order], row[order], layers[order]
+
+    # Paint: obstacles always overwrite traversable; same-priority overwrites
+    current = _bev_layer[row, col]
     overwrite = (
-        (layers != LAYER_UNKNOWN) &              # skip unlabelled points
-        (layers >= current_layers)               # higher/equal priority wins
+        (layers > LAYER_TRAVERSABLE) |            # obstacle always wins over floor
+        ((layers == LAYER_TRAVERSABLE) & (current == LAYER_UNKNOWN)) |
+        ((layers == current) & (layers != LAYER_UNKNOWN))
     )
     _bev_layer[row[overwrite], col[overwrite]] = layers[overwrite]
     _bev_conf[ row[overwrite], col[overwrite]] = 1.0
@@ -307,26 +349,44 @@ def update_bev_semantic(depth_mm: np.ndarray,
 
 
 def _render_bev() -> np.ndarray:
-    img = np.zeros((BEV_H, BEV_W, 3), np.uint8)
+    global _fov_mask
 
-    # Paint semantic layers bottom-up (traversable first, persons last)
+    # Build FOV mask once (needs CAL to be finalised)
+    if _fov_mask is None and _cal_adjusted:
+        _fov_mask = _build_fov_mask()
+
+    # ── Gap fill: morphological close per layer ──────────────────────────────
+    # Work on a copy so _bev_layer is not mutated
+    filled = _bev_layer.copy()
+    for layer_id in [LAYER_TRAVERSABLE, LAYER_VEGETATION,
+                     LAYER_FURNITURE,   LAYER_STRUCTURE,
+                     LAYER_VEHICLE,     LAYER_PERSON]:
+        m = (filled == layer_id).astype(np.uint8)
+        closed = cv2.morphologyEx(m, cv2.MORPH_CLOSE, _FILL_KERNEL)
+        # Only fill UNKNOWN cells — don't overwrite higher-priority layers
+        new_cells = (closed > 0) & (filled == LAYER_UNKNOWN)
+        filled[new_cells] = layer_id
+
+    # ── Paint image ───────────────────────────────────────────────────────────
+    img = np.zeros((BEV_H, BEV_W, 3), np.uint8)
     for layer_id in range(LAYER_UNKNOWN + 1, LAYER_PERSON + 1):
-        mask = _bev_layer == layer_id
+        mask = filled == layer_id
         if mask.any():
             img[mask] = LAYER_COLORS[layer_id]
 
-    # UNKNOWN stays black (already zeros)
+    # ── FOV frustum: black out cells outside camera view ─────────────────────
+    if _fov_mask is not None:
+        img[~_fov_mask] = 0
 
-    # Inflation ring: dilate all non-traversable, non-unknown cells
-    obstacle_mask = np.isin(_bev_layer,
+    # ── Inflation ring ────────────────────────────────────────────────────────
+    obstacle_mask = np.isin(filled,
                             [LAYER_FURNITURE, LAYER_STRUCTURE,
                              LAYER_VEHICLE,   LAYER_PERSON,
                              LAYER_VEGETATION]).astype(np.uint8)
-    dilated = cv2.dilate(obstacle_mask, _INF_KERNEL)
-    inf_mask = (dilated > 0) & (obstacle_mask == 0) & (_bev_layer == LAYER_TRAVERSABLE)
-    # blend orange over the traversable inflation zone
-    img[inf_mask] = (img[inf_mask].astype(np.float32) * 0.4 +
-                     np.array([0, 140, 255], np.float32) * 0.6).astype(np.uint8)
+    dilated  = cv2.dilate(obstacle_mask, _INF_KERNEL)
+    inf_mask = (dilated > 0) & (obstacle_mask == 0) & (filled == LAYER_TRAVERSABLE)
+    img[inf_mask] = (img[inf_mask].astype(np.float32) * 0.35 +
+                     np.array([0, 130, 255], np.float32) * 0.65).astype(np.uint8)
 
     return img
 
