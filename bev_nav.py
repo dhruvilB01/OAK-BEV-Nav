@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """
-bev_nav.py — OAK-D stereo depth → nav-ready semantic BEV costmap
+bev_nav.py — OAK-D stereo depth + SegFormer-B2 → semantic BEV costmap
              + YOLO-World open-vocabulary 3-D object detection
 
-Costmap cell values:
-  UNKNOWN  (  0) → black          no data yet
-  FREE     ( 64) → green          traversable floor
-  INFLATION(160) → orange         within robot radius of obstacle
-  OCCUPIED (255) → red            obstacle point / detected object
+Semantic BEV layers (paint priority: higher index wins):
+  0  UNKNOWN      black        no depth data
+  1  TRAVERSABLE  blue         floor / road / sidewalk / ground
+  2  VEGETATION   dark green   grass / trees / plants
+  3  FURNITURE    purple       indoor obstacles (chair, table, sofa…)
+  4  STRUCTURE    dark red     walls / building / fence / ceiling
+  5  VEHICLE      yellow       car / truck / bus / van / bicycle
+  6  PERSON       cyan         person
 
-Detected objects are projected as cyan labelled rectangles on the BEV.
-RGB view shows floor overlay (magenta) + YOLO bounding boxes.
+Navigation overlay (drawn on top, semi-transparent):
+  INFLATION ring   orange      within robot radius of any non-traversable cell
+
+YOLO-World detected objects → cyan labelled footprint boxes on BEV.
+RGB view: magenta floor overlay + YOLO bounding boxes.
 
 World coords:  X = left,  Y = up,  Z = forward
-Keys:  Q = quit   R = reset costmap
+Keys:  Q = quit   R = reset BEV
 """
 
 import threading
@@ -23,54 +29,132 @@ import cv2
 import depthai as dai
 import numpy as np
 import torch
+import torch.nn.functional as F
+from PIL import Image
+from transformers import (SegformerForSemanticSegmentation,
+                          SegformerImageProcessor)
 from ultralytics import YOLOWorld
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PARAMETERS — tune these to your setup
+# PARAMETERS
 # ═══════════════════════════════════════════════════════════════════════════════
 RGB_W, RGB_H = 640, 400
 
-# Costmap grid
-CELL_MM      = 40          # mm per BEV cell
-BEV_X_MM     = 4000        # ± lateral extent
-BEV_Z_MIN_MM = 200         # nearest depth plane shown
-BEV_Z_MAX_MM = 6000        # farthest depth plane shown
+CELL_MM      = 40           # mm per BEV grid cell
+BEV_X_MM     = 4000         # ± lateral extent
+BEV_Z_MIN_MM = 200          # nearest depth plane
+BEV_Z_MAX_MM = 6000         # farthest depth plane
 
-# Navigation geometry
-ROBOT_RADIUS_MM = 300      # inflation radius around obstacles
-FLOOR_Y_MM      = -200     # world Y below this → traversable floor
-                           # set to ≈ -(camera mount height in mm)
-OBS_Y_MIN_MM    = -100     # world Y above this → obstacle (filters floor noise)
-OBS_Y_MAX_MM    = 2000     # world Y below this → obstacle (ignores ceiling)
+ROBOT_RADIUS_MM = 300       # inflation radius (mm)
+FLOOR_Y_MM      = -200      # world Y below this → ground plane
+                            # ≈ -(camera mount height in mm)
 
-# Open-vocabulary detection
-DETECT_CLASSES   = ["person", "chair", "table", "cardboard box",
-                    "door", "wall", "bag", "bicycle", "trash can"]
-DETECT_CONF      = 0.25
-DETECT_INTERVAL  = 0.10    # seconds between GPU inference runs (~10 fps)
-YOLO_MODEL       = "yolov8s-worldv2.pt"
+# SegFormer model  (B2 = best quality at ~8ms on RTX 5080 fp16)
+SEG_MODEL    = "nvidia/segformer-b2-finetuned-ade-512-512"
+SEG_INTERVAL = 0.04         # seconds between seg inference (~25fps)
 
-# Depth EMA temporal smoothing
-DEPTH_EMA_ALPHA  = 0.25
+# YOLO-World
+DETECT_CLASSES  = ["person", "chair", "table", "cardboard box",
+                   "door", "bag", "bicycle", "trash can", "car"]
+DETECT_CONF     = 0.25
+DETECT_INTERVAL = 0.10      # seconds between detection inference
 
-# Costmap decay: each frame cells fade slightly toward UNKNOWN so stale data
-# doesn't linger.  Values here are subtracted per frame from cell counters.
-FREE_DECAY     = 1          # FREE  cells fade in ~2 s at 30 fps
-OCCUPIED_DECAY = 2          # OCCUPIED fades in ~4 s at 30 fps
+DEPTH_EMA_ALPHA = 0.25
+
+# BEV decay: each frame unseen cells fade toward UNKNOWN
+BEV_DECAY = 0.88            # multiply semantic confidence each frame
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Cell values
-UNKNOWN   =   0
-FREE      =  64
-INFLATION = 160
-OCCUPIED  = 255
+BEV_W       = int(2 * BEV_X_MM / CELL_MM)
+BEV_H       = int((BEV_Z_MAX_MM - BEV_Z_MIN_MM) / CELL_MM)
+ROBOT_CELLS = max(1, int(ROBOT_RADIUS_MM / CELL_MM))
 
-BEV_W        = int(2 * BEV_X_MM / CELL_MM)
-BEV_H        = int((BEV_Z_MAX_MM - BEV_Z_MIN_MM) / CELL_MM)
-ROBOT_CELLS  = max(1, int(ROBOT_RADIUS_MM / CELL_MM))
 
-# Pre-build circular inflation kernel
+# ── ADE20K → semantic layer mapping ──────────────────────────────────────────
+# ADE20K 150-class indices → layer index (0=unknown, see LAYER_* consts below)
+LAYER_UNKNOWN     = 0
+LAYER_TRAVERSABLE = 1
+LAYER_VEGETATION  = 2
+LAYER_FURNITURE   = 3
+LAYER_STRUCTURE   = 4
+LAYER_VEHICLE     = 5
+LAYER_PERSON      = 6
+
+# BGR colors for each layer
+LAYER_COLORS = {
+    LAYER_UNKNOWN:     (  20,  20,  20),   # near-black
+    LAYER_TRAVERSABLE: ( 180,  90,   0),   # blue (road/floor)
+    LAYER_VEGETATION:  (  30, 130,  30),   # dark green
+    LAYER_FURNITURE:   ( 130,  30, 130),   # purple
+    LAYER_STRUCTURE:   (  40,  40, 160),   # dark red
+    LAYER_VEHICLE:     (   0, 200, 220),   # yellow
+    LAYER_PERSON:      ( 220, 220,   0),   # cyan
+}
+
+# ADE20K class index → layer (unlisted = UNKNOWN → not painted)
+_ADE_TO_LAYER = {
+    # Traversable ground
+    3:  LAYER_TRAVERSABLE,   # floor
+    6:  LAYER_TRAVERSABLE,   # road
+    11: LAYER_TRAVERSABLE,   # sidewalk
+    13: LAYER_TRAVERSABLE,   # earth / ground
+    52: LAYER_TRAVERSABLE,   # path
+    54: LAYER_TRAVERSABLE,   # runway
+    91: LAYER_TRAVERSABLE,   # dirt track
+    94: LAYER_TRAVERSABLE,   # land / soil
+    # Vegetation
+    4:  LAYER_VEGETATION,    # tree
+    9:  LAYER_VEGETATION,    # grass
+    17: LAYER_VEGETATION,    # plant
+    29: LAYER_VEGETATION,    # field
+    66: LAYER_VEGETATION,    # flower
+    72: LAYER_VEGETATION,    # palm
+    # Furniture / indoor obstacles
+    7:  LAYER_FURNITURE,     # bed
+    15: LAYER_FURNITURE,     # table
+    19: LAYER_FURNITURE,     # chair
+    23: LAYER_FURNITURE,     # sofa
+    24: LAYER_FURNITURE,     # shelf
+    30: LAYER_FURNITURE,     # armchair
+    31: LAYER_FURNITURE,     # seat
+    33: LAYER_FURNITURE,     # desk
+    41: LAYER_FURNITURE,     # box
+    64: LAYER_FURNITURE,     # coffee table
+    97: LAYER_FURNITURE,     # ottoman
+    110: LAYER_FURNITURE,    # stool
+    # Structure / hard obstacles
+    0:  LAYER_STRUCTURE,     # wall
+    1:  LAYER_STRUCTURE,     # building
+    10: LAYER_STRUCTURE,     # cabinet
+    25: LAYER_STRUCTURE,     # house
+    32: LAYER_STRUCTURE,     # fence
+    38: LAYER_STRUCTURE,     # railing
+    42: LAYER_STRUCTURE,     # column
+    48: LAYER_STRUCTURE,     # skyscraper
+    53: LAYER_STRUCTURE,     # stairs
+    59: LAYER_STRUCTURE,     # stairway
+    84: LAYER_STRUCTURE,     # tower
+    93: LAYER_STRUCTURE,     # pole
+    # Vehicles
+    20: LAYER_VEHICLE,       # car
+    80: LAYER_VEHICLE,       # bus
+    83: LAYER_VEHICLE,       # truck
+    102: LAYER_VEHICLE,      # van
+    116: LAYER_VEHICLE,      # motorbike
+    127: LAYER_VEHICLE,      # bicycle
+    # Person
+    12: LAYER_PERSON,        # person
+}
+
+# Build lookup table (150 entries)
+_ADE_LUT = np.zeros(150, dtype=np.uint8)   # default → UNKNOWN
+for ade_id, layer in _ADE_TO_LAYER.items():
+    if ade_id < 150:
+        _ADE_LUT[ade_id] = layer
+
+
+# Inflation kernel (circular, radius = robot_cells)
 def _circle_kernel(r):
     d = 2 * r + 1
     k = np.zeros((d, d), np.uint8)
@@ -79,7 +163,7 @@ def _circle_kernel(r):
 
 _INF_KERNEL = _circle_kernel(ROBOT_CELLS)
 
-# Jet LUT for depth visualisation
+# Jet LUT
 _LUT = cv2.applyColorMap(np.arange(256, dtype=np.uint8), cv2.COLORMAP_JET)
 
 
@@ -112,42 +196,7 @@ def _adjust_cal(h, w):
     if abs(sx - 1.0) > 0.01 or abs(sy - 1.0) > 0.01:
         CAL['fx'] *= sx;  CAL['cx'] *= sx
         CAL['fy'] *= sy;  CAL['cy'] *= sy
-        print(f"[cal] rescaled for {w}×{h} → "
-              f"fx={CAL['fx']:.1f} cx={CAL['cx']:.1f}")
-
-
-# ── Back-projection ───────────────────────────────────────────────────────────
-def depth_to_xyz(depth_mm: np.ndarray) -> np.ndarray:
-    """Return Nx3 array (X=left, Y=up, Z=forward) for all valid pixels."""
-    h, w = depth_mm.shape
-    uu, vv = np.meshgrid(np.arange(w), np.arange(h))
-    d = depth_mm.astype(np.float32)
-    valid = (d > BEV_Z_MIN_MM) & (d < BEV_Z_MAX_MM)
-    z = d[valid]
-    x = -(uu[valid] - CAL['cx']) * z / CAL['fx']
-    y = -(vv[valid] - CAL['cy']) * z / CAL['fy']
-    return np.column_stack((x, y, z))
-
-
-def bbox_depth_sample(depth_mm: np.ndarray,
-                      x1: int, y1: int, x2: int, y2: int) -> float | None:
-    """Median depth of inner 50% of a 2-D bounding box. Returns mm or None."""
-    mx, my = (x1 + x2) // 2, (y1 + y2) // 2
-    bw, bh = max(1, (x2 - x1) // 4), max(1, (y2 - y1) // 4)
-    roi = depth_mm[max(0, my - bh):my + bh, max(0, mx - bw):mx + bw]
-    v = roi[roi > 0]
-    return float(np.median(v)) if v.size > 0 else None
-
-
-# ── Floor mask ────────────────────────────────────────────────────────────────
-def make_floor_mask(depth_mm: np.ndarray) -> np.ndarray:
-    h = depth_mm.shape[0]
-    vv = np.arange(h)[:, None]
-    d  = depth_mm.astype(np.float32)
-    valid = d > 0
-    z = np.where(valid, d, 1.0)
-    y_world = -(vv - CAL['cy']) * z / CAL['fy']
-    return valid & (y_world < FLOOR_Y_MM)
+        print(f"[cal] rescaled for {w}×{h} → fx={CAL['fx']:.1f}")
 
 
 # ── Depth EMA ─────────────────────────────────────────────────────────────────
@@ -160,9 +209,9 @@ def apply_depth_ema(raw: np.ndarray) -> np.ndarray:
     if _DEPTH_EMA is None or _DEPTH_EMA.shape != f.shape:
         _DEPTH_EMA = f.copy()
         return raw
-    both        = (f > 0) & (_DEPTH_EMA > 0)
-    new_only    = (f > 0) & (_DEPTH_EMA == 0)
-    lost        = (f == 0) & (_DEPTH_EMA > 0)
+    both     = (f > 0) & (_DEPTH_EMA > 0)
+    new_only = (f > 0) & (_DEPTH_EMA == 0)
+    lost     = (f == 0) & (_DEPTH_EMA > 0)
     _DEPTH_EMA[both]     = DEPTH_EMA_ALPHA * f[both] + (1 - DEPTH_EMA_ALPHA) * _DEPTH_EMA[both]
     _DEPTH_EMA[new_only] = f[new_only]
     _DEPTH_EMA[lost]    *= 0.7
@@ -170,94 +219,123 @@ def apply_depth_ema(raw: np.ndarray) -> np.ndarray:
     return _DEPTH_EMA.astype(np.uint16)
 
 
-# ── Semantic costmap ──────────────────────────────────────────────────────────
-# Two internal accumulators: one for free evidence, one for occupied evidence.
-# Final cell value is determined each frame from the accumulators.
-_free_acc = np.zeros((BEV_H, BEV_W), np.float32)
-_occ_acc  = np.zeros((BEV_H, BEV_W), np.float32)
-_OCC_MAX  = 10.0   # saturation cap for accumulators
-_FREE_MAX  = 10.0
+# ── Floor mask (for RGB overlay) ──────────────────────────────────────────────
+def make_floor_mask(depth_mm: np.ndarray) -> np.ndarray:
+    h  = depth_mm.shape[0]
+    vv = np.arange(h)[:, None]
+    d  = depth_mm.astype(np.float32)
+    valid = d > 0
+    z = np.where(valid, d, 1.0)
+    y_world = -(vv - CAL['cy']) * z / CAL['fy']
+    return valid & (y_world < FLOOR_Y_MM)
 
 
-def reset_costmap():
-    _free_acc[:] = 0.0
-    _occ_acc[:]  = 0.0
+# ── Semantic BEV ──────────────────────────────────────────────────────────────
+# Persistent BEV: layer index per cell + confidence [0,1] that decays
+_bev_layer = np.zeros((BEV_H, BEV_W), dtype=np.uint8)    # layer index
+_bev_conf  = np.zeros((BEV_H, BEV_W), dtype=np.float32)  # confidence
 
 
-def _world_to_cell(x_mm: float, z_mm: float):
-    col = int((x_mm + BEV_X_MM) / CELL_MM)
-    row = int(BEV_H - 1 - (z_mm - BEV_Z_MIN_MM) / CELL_MM)
-    return col, row
+def reset_bev():
+    _bev_layer[:] = LAYER_UNKNOWN
+    _bev_conf[:]  = 0.0
 
 
-def update_costmap(xyz: np.ndarray) -> np.ndarray:
+# Pre-build pixel coordinate grids (reused every frame)
+_grid_u: np.ndarray | None = None
+_grid_v: np.ndarray | None = None
+
+
+def _get_grids(h, w):
+    global _grid_u, _grid_v
+    if _grid_u is None or _grid_u.shape != (h, w):
+        _grid_u, _grid_v = np.meshgrid(np.arange(w), np.arange(h))
+    return _grid_u, _grid_v
+
+
+def update_bev_semantic(depth_mm: np.ndarray,
+                        seg_mask: np.ndarray) -> np.ndarray:
     """
-    Ingest new point cloud, update accumulators, return rendered BGR costmap.
+    Project depth+semantics onto BEV grid.
+    Returns rendered BGR BEV image (with inflation overlay).
     """
-    # --- decay accumulators toward zero ---
-    _free_acc[:] = np.clip(_free_acc - 0.05, 0, _FREE_MAX)
-    _occ_acc[:]  = np.clip(_occ_acc  - 0.07, 0, _OCC_MAX)
+    # --- decay old observations ---
+    _bev_conf[:] *= BEV_DECAY
+    faded = _bev_conf < 0.05
+    _bev_layer[faded] = LAYER_UNKNOWN
+    _bev_conf[faded]  = 0.0
 
-    if len(xyz) > 0:
-        x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
-        in_range = ((z > BEV_Z_MIN_MM) & (z < BEV_Z_MAX_MM) &
-                    (x > -BEV_X_MM)    & (x < BEV_X_MM))
+    h, w = depth_mm.shape
+    uu, vv = _get_grids(h, w)
 
-        # floor points → free evidence
-        floor_mask = in_range & (y < FLOOR_Y_MM)
-        if floor_mask.any():
-            col = np.clip(((x[floor_mask] + BEV_X_MM) / CELL_MM).astype(np.int32),
-                          0, BEV_W - 1)
-            row = np.clip((BEV_H - 1 - (z[floor_mask] - BEV_Z_MIN_MM) / CELL_MM
-                           ).astype(np.int32), 0, BEV_H - 1)
-            np.add.at(_free_acc, (row, col), 1.0)
-            _free_acc[:] = np.minimum(_free_acc, _FREE_MAX)
+    d = depth_mm.astype(np.float32)
+    valid = (d > BEV_Z_MIN_MM) & (d < BEV_Z_MAX_MM)
 
-        # above-floor points → occupied evidence
-        obs_mask = in_range & (y >= OBS_Y_MIN_MM) & (y < OBS_Y_MAX_MM)
-        if obs_mask.any():
-            col = np.clip(((x[obs_mask] + BEV_X_MM) / CELL_MM).astype(np.int32),
-                          0, BEV_W - 1)
-            row = np.clip((BEV_H - 1 - (z[obs_mask] - BEV_Z_MIN_MM) / CELL_MM
-                           ).astype(np.int32), 0, BEV_H - 1)
-            np.add.at(_occ_acc, (row, col), 1.0)
-            _occ_acc[:] = np.minimum(_occ_acc, _OCC_MAX)
+    z = d[valid]
+    x = -(uu[valid] - CAL['cx']) * z / CAL['fx']
+    y = -(vv[valid] - CAL['cy']) * z / CAL['fy']
 
-    # --- derive costmap from accumulators ---
-    costmap = np.full((BEV_H, BEV_W), UNKNOWN, np.uint8)
+    # Map to BEV grid cells
+    col = ((x + BEV_X_MM) / CELL_MM).astype(np.int32)
+    row = (BEV_H - 1 - (z - BEV_Z_MIN_MM) / CELL_MM).astype(np.int32)
+    in_grid = (col >= 0) & (col < BEV_W) & (row >= 0) & (row < BEV_H)
 
-    free_cells = _free_acc > 0.5
-    occ_cells  = _occ_acc  > 0.5
+    col = col[in_grid]
+    row = row[in_grid]
+    z_g = z[in_grid]
+    y_g = y[in_grid]
 
-    # free wins only where no occupied evidence
-    costmap[free_cells & ~occ_cells] = FREE
-    # occupied always wins
-    costmap[occ_cells] = OCCUPIED
+    # Semantic labels for valid+in-grid pixels
+    seg_flat = seg_mask[valid][in_grid].astype(np.int32)
+    seg_flat = np.clip(seg_flat, 0, 149)
+    layers   = _ADE_LUT[seg_flat]
 
-    # inflation: dilate occupied, apply over free/unknown but not occupied
-    occ_layer = (costmap == OCCUPIED).astype(np.uint8)
-    dilated   = cv2.dilate(occ_layer, _INF_KERNEL)
-    inf_mask  = (dilated > 0) & (costmap != OCCUPIED)
-    costmap[inf_mask] = INFLATION
+    # Sort by depth (far → near) so near points overwrite far ones
+    order = np.argsort(-z_g)
+    col, row, layers, y_g = col[order], row[order], layers[order], y_g[order]
 
-    return costmap
+    # Paint: higher priority layers overwrite lower ones
+    current_layers = _bev_layer[row, col]
+    overwrite = (
+        (layers != LAYER_UNKNOWN) &              # skip unlabelled points
+        (layers >= current_layers)               # higher/equal priority wins
+    )
+    _bev_layer[row[overwrite], col[overwrite]] = layers[overwrite]
+    _bev_conf[ row[overwrite], col[overwrite]] = 1.0
+
+    return _render_bev()
 
 
-def render_costmap(costmap: np.ndarray) -> np.ndarray:
+def _render_bev() -> np.ndarray:
     img = np.zeros((BEV_H, BEV_W, 3), np.uint8)
-    img[costmap == FREE]      = (  0, 200,   0)   # green
-    img[costmap == INFLATION] = (  0, 140, 255)   # orange
-    img[costmap == OCCUPIED]  = (  0,   0, 255)   # red
-    # UNKNOWN stays black
+
+    # Paint semantic layers bottom-up (traversable first, persons last)
+    for layer_id in range(LAYER_UNKNOWN + 1, LAYER_PERSON + 1):
+        mask = _bev_layer == layer_id
+        if mask.any():
+            img[mask] = LAYER_COLORS[layer_id]
+
+    # UNKNOWN stays black (already zeros)
+
+    # Inflation ring: dilate all non-traversable, non-unknown cells
+    obstacle_mask = np.isin(_bev_layer,
+                            [LAYER_FURNITURE, LAYER_STRUCTURE,
+                             LAYER_VEHICLE,   LAYER_PERSON,
+                             LAYER_VEGETATION]).astype(np.uint8)
+    dilated = cv2.dilate(obstacle_mask, _INF_KERNEL)
+    inf_mask = (dilated > 0) & (obstacle_mask == 0) & (_bev_layer == LAYER_TRAVERSABLE)
+    # blend orange over the traversable inflation zone
+    img[inf_mask] = (img[inf_mask].astype(np.float32) * 0.4 +
+                     np.array([0, 140, 255], np.float32) * 0.6).astype(np.uint8)
+
     return img
 
 
 def draw_bev_overlay(bev_img: np.ndarray, detections: list) -> np.ndarray:
-    """Add grid, camera marker, and YOLO-World object footprint boxes."""
     out = bev_img.copy()
     cx  = BEV_W // 2
 
-    # distance grid lines
+    # Grid
     cv2.line(out, (cx, 0), (cx, BEV_H), (55, 55, 55), 1)
     for d_m in range(1, BEV_Z_MAX_MM // 1000 + 1):
         r = BEV_H - 1 - int((d_m * 1000 - BEV_Z_MIN_MM) / CELL_MM)
@@ -266,37 +344,40 @@ def draw_bev_overlay(bev_img: np.ndarray, detections: list) -> np.ndarray:
             cv2.putText(out, f"{d_m}m", (2, r - 2),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.30, (120, 120, 120), 1)
 
-    # camera origin marker
+    # Camera marker
     cv2.drawMarker(out, (cx, BEV_H - 1), (0, 255, 0),
                    cv2.MARKER_TRIANGLE_UP, 12, 2)
 
-    # object footprint rectangles
+    # YOLO-World detection footprints
     for det in detections:
-        label, conf = det['label'], det['conf']
-        cx3, cz3    = det['cx3'], det['cz3']
-        hw, hd      = det['half_w'], det['half_d']
-
+        label, conf     = det['label'], det['conf']
+        cx3, cz3        = det['cx3'],   det['cz3']
+        hw, hd          = det['half_w'], det['half_d']
         c1 = int((cx3 - hw + BEV_X_MM) / CELL_MM)
         c2 = int((cx3 + hw + BEV_X_MM) / CELL_MM)
         r1 = int(BEV_H - 1 - (cz3 + hd - BEV_Z_MIN_MM) / CELL_MM)
         r2 = int(BEV_H - 1 - (cz3 - hd - BEV_Z_MIN_MM) / CELL_MM)
         c1, c2 = sorted([c1, c2])
         r1, r2 = sorted([r1, r2])
-        cv2.rectangle(out, (c1, r1), (c2, r2), (255, 255, 0), 1)
-        cv2.putText(out, f"{label} {conf:.0%}",
-                    (max(c1, 0), max(r1 - 2, 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255, 255, 0), 1)
+        cv2.rectangle(out, (c1, r1), (c2, r2), (255, 255, 255), 1)
+        cv2.putText(out, f"{label} {conf:.0%}", (max(c1, 0), max(r1 - 2, 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255, 255, 255), 1)
 
-    # legend (bottom-left corner)
-    items = [("FREE",      (  0, 200,   0)),
-             ("INFLATION", (  0, 140, 255)),
-             ("OCCUPIED",  (  0,   0, 255)),
-             ("OBJECT",    (255, 255,   0))]
-    for i, (name, color) in enumerate(items):
-        y = BEV_H - 6 - i * 10
-        cv2.rectangle(out, (2, y - 6), (10, y), color, -1)
-        cv2.putText(out, name, (13, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.26, (200, 200, 200), 1)
+    # Legend
+    legend = [
+        ("ROAD/FLOOR",  LAYER_COLORS[LAYER_TRAVERSABLE]),
+        ("VEGETATION",  LAYER_COLORS[LAYER_VEGETATION]),
+        ("FURNITURE",   LAYER_COLORS[LAYER_FURNITURE]),
+        ("STRUCTURE",   LAYER_COLORS[LAYER_STRUCTURE]),
+        ("VEHICLE",     LAYER_COLORS[LAYER_VEHICLE]),
+        ("PERSON",      LAYER_COLORS[LAYER_PERSON]),
+        ("INFLATION",   (0, 140, 255)),
+    ]
+    for i, (name, color) in enumerate(reversed(legend)):
+        y = BEV_H - 6 - i * 11
+        cv2.rectangle(out, (2, y - 7), (11, y), color, -1)
+        cv2.putText(out, name, (14, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.27, (200, 200, 200), 1)
 
     return out
 
@@ -305,30 +386,42 @@ def draw_bev_overlay(bev_img: np.ndarray, detections: list) -> np.ndarray:
 _MAGENTA = np.array([255, 0, 255], np.float32)
 
 
-def annotate_rgb(rgb: np.ndarray,
-                 depth_mm: np.ndarray,
-                 detections: list,
-                 floor_alpha: float = 0.45) -> np.ndarray:
-    """Floor overlay + YOLO bounding boxes on the RGB frame."""
-    # floor mask
+def annotate_rgb(rgb: np.ndarray, depth_mm: np.ndarray,
+                 detections: list) -> np.ndarray:
+    # Floor magenta overlay
     mask = make_floor_mask(depth_mm)
     if mask.shape != rgb.shape[:2]:
         mask = cv2.resize(mask.astype(np.uint8),
                           (rgb.shape[1], rgb.shape[0]),
                           interpolation=cv2.INTER_NEAREST).astype(bool)
     out = rgb.astype(np.float32)
-    out[mask] = (1 - floor_alpha) * out[mask] + floor_alpha * _MAGENTA
+    out[mask] = 0.55 * out[mask] + 0.45 * _MAGENTA
     out = out.astype(np.uint8)
 
-    # detection boxes
+    # YOLO detections
     for det in detections:
         x1, y1, x2, y2 = det['box2d']
-        label, conf     = det['label'], det['conf']
         cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 255), 2)
-        cv2.putText(out, f"{label} {conf:.0%}", (x1, max(y1 - 4, 10)),
+        cv2.putText(out, f"{det['label']} {det['conf']:.0%}",
+                    (x1, max(y1 - 4, 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
 
     return out
+
+
+# ── Semantic segmentation overlay (debug) ─────────────────────────────────────
+def render_seg_overlay(rgb: np.ndarray, seg_mask: np.ndarray) -> np.ndarray:
+    """Colour-coded segmentation mask blended over RGB."""
+    color_img = np.zeros_like(rgb)
+    for ade_id, layer in _ADE_TO_LAYER.items():
+        m = seg_mask == ade_id
+        if m.any():
+            color_img[m] = LAYER_COLORS[layer]
+    if seg_mask.shape != rgb.shape[:2]:
+        color_img = cv2.resize(color_img,
+                               (rgb.shape[1], rgb.shape[0]),
+                               interpolation=cv2.INTER_NEAREST)
+    return cv2.addWeighted(rgb, 0.45, color_img, 0.55, 0)
 
 
 # ── Depth coloriser ───────────────────────────────────────────────────────────
@@ -337,10 +430,19 @@ def colorize_depth(d: np.ndarray) -> np.ndarray:
     if v.size == 0:
         return np.zeros((*d.shape, 3), np.uint8)
     lo, hi = np.percentile(v, 2), np.percentile(v, 98)
-    n   = np.clip((d.astype(np.float32) - lo) / max(hi - lo, 1), 0, 1)
+    n = np.clip((d.astype(np.float32) - lo) / max(hi - lo, 1), 0, 1)
     out = _LUT[(n * 255).astype(np.uint8), 0].copy()
     out[d == 0] = 0
     return out
+
+
+def bbox_depth_sample(depth_mm, x1, y1, x2, y2):
+    mx, my = (x1 + x2) // 2, (y1 + y2) // 2
+    bw = max(1, (x2 - x1) // 4)
+    bh = max(1, (y2 - y1) // 4)
+    roi = depth_mm[max(0, my - bh):my + bh, max(0, mx - bw):mx + bw]
+    v = roi[roi > 0]
+    return float(np.median(v)) if v.size > 0 else None
 
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -348,10 +450,60 @@ _cam_lock     = threading.Lock()
 _latest_depth: np.ndarray | None = None
 _latest_rgb:   np.ndarray | None = None
 
-_det_lock   = threading.Lock()
-_detections: list = []   # list of detection dicts (see detection_thread)
+_seg_lock     = threading.Lock()
+_latest_seg:  np.ndarray | None = None   # H×W uint8 ADE20K class IDs
+
+_det_lock     = threading.Lock()
+_detections:  list = []
 
 _running = True
+
+
+# ── Segmentation thread ───────────────────────────────────────────────────────
+def seg_thread():
+    global _latest_seg, _running
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype  = torch.float16 if device == "cuda" else torch.float32
+    print(f"[seg] Loading {SEG_MODEL} on {device} fp16={dtype==torch.float16} …")
+
+    processor = SegformerImageProcessor.from_pretrained(SEG_MODEL)
+    model     = SegformerForSemanticSegmentation.from_pretrained(SEG_MODEL)
+    model.to(device, dtype=dtype).eval()
+    print("[seg] Ready")
+
+    while _running:
+        t0 = time.monotonic()
+
+        with _cam_lock:
+            rgb = _latest_rgb
+
+        if rgb is None:
+            time.sleep(0.05)
+            continue
+
+        pil_img = Image.fromarray(cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB))
+        inputs  = processor(images=pil_img, return_tensors="pt")
+        inputs  = {k: v.to(device, dtype=dtype) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            logits = model(**inputs).logits   # [1, 150, H/4, W/4]
+
+        # Upsample to original RGB size
+        logits_up = F.interpolate(
+            logits.float(),
+            size=(rgb.shape[0], rgb.shape[1]),
+            mode="bilinear",
+            align_corners=False,
+        )
+        seg = logits_up.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
+
+        with _seg_lock:
+            _latest_seg = seg
+
+        elapsed = time.monotonic() - t0
+        if elapsed < SEG_INTERVAL:
+            time.sleep(SEG_INTERVAL - elapsed)
 
 
 # ── YOLO-World detection thread ───────────────────────────────────────────────
@@ -359,8 +511,8 @@ def detection_thread():
     global _detections, _running
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[det] Loading {YOLO_MODEL} on {device} …")
-    model = YOLOWorld(YOLO_MODEL)
+    print(f"[det] Loading YOLO-World on {device} …")
+    model = YOLOWorld("yolov8s-worldv2.pt")
     model.set_classes(DETECT_CLASSES)
     model.to(device)
     print(f"[det] Ready — classes: {DETECT_CLASSES}")
@@ -389,30 +541,22 @@ def detection_thread():
             if z is None or z < BEV_Z_MIN_MM or z > BEV_Z_MAX_MM:
                 continue
 
-            # 3-D centroid (X=left convention)
             px_cx = (x1 + x2) / 2.0
             cx3   = -(px_cx - CAL['cx']) * z / CAL['fx']
-
-            # Approximate footprint half-extents from angular box width
             half_w = abs((x2 - x1) / 2.0 * z / CAL['fx'])
-            half_d = max(half_w * 0.6, 150.0)   # assume ~square, min 300 mm
+            half_d = max(half_w * 0.6, 150.0)
 
-            dets.append({
-                'label':  label,
-                'conf':   conf,
-                'box2d':  (x1, y1, x2, y2),
-                'cx3':    cx3,
-                'cz3':    z,
-                'half_w': half_w,
-                'half_d': half_d,
-            })
+            dets.append(dict(label=label, conf=conf,
+                             box2d=(x1, y1, x2, y2),
+                             cx3=cx3, cz3=z,
+                             half_w=half_w, half_d=half_d))
 
         with _det_lock:
             _detections = dets
 
-        sleep = DETECT_INTERVAL - (time.monotonic() - t0)
-        if sleep > 0:
-            time.sleep(sleep)
+        elapsed = time.monotonic() - t0
+        if elapsed < DETECT_INTERVAL:
+            time.sleep(DETECT_INTERVAL - elapsed)
 
 
 # ── Camera thread ─────────────────────────────────────────────────────────────
@@ -430,7 +574,6 @@ def camera_thread():
     camRgb     = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
     rgb_stream = camRgb.requestOutput((RGB_W, RGB_H), dai.ImgFrame.Type.BGR888p)
 
-    # Stereo config
     stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.ROBOTICS)
     stereo.setLeftRightCheck(True)
     stereo.setSubpixel(True)
@@ -441,19 +584,19 @@ def camera_thread():
     stereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
     try:
         cfg = stereo.initialConfig.get()
-        cfg.postProcessing.spatialFilter.enable             = True
-        cfg.postProcessing.spatialFilter.holeFillingRadius  = 2
-        cfg.postProcessing.spatialFilter.numIterations      = 1
-        cfg.postProcessing.spatialFilter.alpha              = 0.5
-        cfg.postProcessing.spatialFilter.delta              = 20
-        cfg.postProcessing.temporalFilter.enable            = True
-        cfg.postProcessing.temporalFilter.alpha             = 0.2
-        cfg.postProcessing.speckleFilter.enable             = True
-        cfg.postProcessing.speckleFilter.speckleRange       = 50
+        cfg.postProcessing.spatialFilter.enable            = True
+        cfg.postProcessing.spatialFilter.holeFillingRadius = 2
+        cfg.postProcessing.spatialFilter.numIterations     = 1
+        cfg.postProcessing.spatialFilter.alpha             = 0.5
+        cfg.postProcessing.spatialFilter.delta             = 20
+        cfg.postProcessing.temporalFilter.enable           = True
+        cfg.postProcessing.temporalFilter.alpha            = 0.2
+        cfg.postProcessing.speckleFilter.enable            = True
+        cfg.postProcessing.speckleFilter.speckleRange      = 50
         stereo.initialConfig.set(cfg)
         print("[stereo] filters: 7×7 median + spatial + temporal + speckle")
     except Exception as e:
-        print(f"[stereo] filter config failed ({e}), using median only")
+        print(f"[stereo] filter config failed ({e}), median only")
 
     depth_q = stereo.depth.createOutputQueue(maxSize=2, blocking=False)
     rgb_q   = rgb_stream.createOutputQueue(maxSize=2, blocking=False)
@@ -486,52 +629,63 @@ def main():
     global _running
 
     cam_t = threading.Thread(target=camera_thread,   daemon=True)
+    seg_t = threading.Thread(target=seg_thread,      daemon=True)
     det_t = threading.Thread(target=detection_thread, daemon=True)
     cam_t.start()
+    seg_t.start()
     det_t.start()
 
-    scale = min(1.0, 700 / BEV_H)
-    bev_disp_size = (int(BEV_W * scale), int(BEV_H * scale))
+    scale        = min(1.0, 700 / BEV_H)
+    bev_disp     = (int(BEV_W * scale), int(BEV_H * scale))
+    show_seg_dbg = False   # toggle with 'S'
 
-    print(f"BEV {BEV_W}×{BEV_H} cells @ {CELL_MM} mm/cell | "
-          f"robot radius {ROBOT_RADIUS_MM} mm ({ROBOT_CELLS} cells) | "
-          f"Q=quit  R=reset")
+    print(f"BEV {BEV_W}×{BEV_H} @ {CELL_MM}mm/cell | "
+          f"robot radius {ROBOT_RADIUS_MM}mm | Q=quit R=reset S=seg-debug")
 
     while _running:
         with _cam_lock:
             depth_mm = _latest_depth
             rgb_img  = _latest_rgb
+        with _seg_lock:
+            seg_mask = _latest_seg
         with _det_lock:
             detections = list(_detections)
 
-        if depth_mm is not None:
-            # Costmap update
-            xyz      = depth_to_xyz(depth_mm)
-            costmap  = update_costmap(xyz)
-            bev_img  = render_costmap(costmap)
-            bev_vis  = draw_bev_overlay(bev_img, detections)
-            cv2.imshow("BEV Costmap",
-                       cv2.resize(bev_vis, bev_disp_size,
+        if depth_mm is not None and seg_mask is not None:
+            bev_img = update_bev_semantic(depth_mm, seg_mask)
+            bev_vis = draw_bev_overlay(bev_img, detections)
+            cv2.imshow("Semantic BEV",
+                       cv2.resize(bev_vis, bev_disp,
                                   interpolation=cv2.INTER_NEAREST))
 
-            # Depth view
+            if rgb_img is not None:
+                cv2.imshow("RGB | floor + detections",
+                           annotate_rgb(rgb_img, depth_mm, detections))
+                if show_seg_dbg:
+                    cv2.imshow("Seg debug",
+                               render_seg_overlay(rgb_img, seg_mask))
+
             cv2.imshow("Depth", colorize_depth(depth_mm))
 
-            # RGB + floor + detections
-            if rgb_img is not None:
-                cv2.imshow("RGB | floor + objects",
-                           annotate_rgb(rgb_img, depth_mm, detections))
+        elif depth_mm is not None:
+            # Seg not ready yet — show depth only
+            cv2.imshow("Depth", colorize_depth(depth_mm))
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             _running = False
             break
         elif key == ord('r'):
-            reset_costmap()
-            print("[map] costmap reset")
+            reset_bev()
+            print("[map] BEV reset")
+        elif key == ord('s'):
+            show_seg_dbg = not show_seg_dbg
+            if not show_seg_dbg:
+                cv2.destroyWindow("Seg debug")
 
     cv2.destroyAllWindows()
     cam_t.join(timeout=3)
+    seg_t.join(timeout=3)
     det_t.join(timeout=3)
     print("Done.")
 
