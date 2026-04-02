@@ -355,30 +355,53 @@ def _render_bev() -> np.ndarray:
     if _fov_mask is None and _cal_adjusted:
         _fov_mask = _build_fov_mask()
 
-    # ── Gap fill: morphological close per layer ──────────────────────────────
-    # Work on a copy so _bev_layer is not mutated
+    # ── Stage 1: column-wise floor fill (key technique from the paper) ────────
+    # For each BEV column, find the nearest (lowest row = closest to camera)
+    # non-UNKNOWN cell. Everything below it (between camera and that point)
+    # that is still UNKNOWN gets filled as TRAVERSABLE.
+    # This produces the solid floor wedge visible in image 2.
     filled = _bev_layer.copy()
-    for layer_id in [LAYER_TRAVERSABLE, LAYER_VEGETATION,
-                     LAYER_FURNITURE,   LAYER_STRUCTURE,
-                     LAYER_VEHICLE,     LAYER_PERSON]:
+
+    # Inside-FOV mask (all True if not yet built)
+    fov = _fov_mask if _fov_mask is not None else np.ones((BEV_H, BEV_W), bool)
+
+    # known[r,c] = True if that cell has a real detection (not UNKNOWN)
+    known = (filled != LAYER_UNKNOWN)
+
+    # For each column, find the highest row index (nearest to camera) that is known
+    # np.argmax on flipped axis gives first True from bottom
+    has_any = known.any(axis=0)                         # (BEV_W,)
+    # contact_row[c] = row of nearest detection in column c (BEV_H-1 if none)
+    contact_row = np.where(has_any,
+                           BEV_H - 1 - np.argmax(known[::-1, :], axis=0),
+                           -1)                          # -1 = no detection
+
+    # Build fill mask: rows below contact_row, inside FOV, currently UNKNOWN
+    rows = np.arange(BEV_H)[:, None]                   # (BEV_H, 1)
+    below_contact = rows > contact_row[None, :]         # (BEV_H, BEV_W)
+    fill_mask = below_contact & fov & (filled == LAYER_UNKNOWN)
+    filled[fill_mask] = LAYER_TRAVERSABLE
+
+    # ── Stage 2: small morphological close to smooth obstacle boundaries ──────
+    for layer_id in [LAYER_VEGETATION, LAYER_FURNITURE,
+                     LAYER_STRUCTURE,  LAYER_VEHICLE, LAYER_PERSON]:
         m = (filled == layer_id).astype(np.uint8)
         closed = cv2.morphologyEx(m, cv2.MORPH_CLOSE, _FILL_KERNEL)
-        # Only fill UNKNOWN cells — don't overwrite higher-priority layers
         new_cells = (closed > 0) & (filled == LAYER_UNKNOWN)
         filled[new_cells] = layer_id
 
-    # ── Paint image ───────────────────────────────────────────────────────────
+    # ── Stage 3: paint image ──────────────────────────────────────────────────
     img = np.zeros((BEV_H, BEV_W, 3), np.uint8)
     for layer_id in range(LAYER_UNKNOWN + 1, LAYER_PERSON + 1):
         mask = filled == layer_id
         if mask.any():
             img[mask] = LAYER_COLORS[layer_id]
 
-    # ── FOV frustum: black out cells outside camera view ─────────────────────
+    # ── Stage 4: FOV frustum — black outside camera view ─────────────────────
     if _fov_mask is not None:
         img[~_fov_mask] = 0
 
-    # ── Inflation ring ────────────────────────────────────────────────────────
+    # ── Stage 5: inflation ring ───────────────────────────────────────────────
     obstacle_mask = np.isin(filled,
                             [LAYER_FURNITURE, LAYER_STRUCTURE,
                              LAYER_VEHICLE,   LAYER_PERSON,
