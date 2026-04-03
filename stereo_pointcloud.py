@@ -453,8 +453,9 @@ def render_cam_bev(rgb, depth_mm):
 
     h, w   = rgb.shape[:2]
     out_sz = CAM_BEV_SIZE
-    R_mm   = CAM_BEV_RANGE_M * 1000.0          # half-range in mm
-    S      = CAM_BEV_RANGE_M * 2000.0 / out_sz  # mm per BEV pixel
+    # Forward: 0 → CAM_BEV_RANGE_M.  Lateral: ±CAM_BEV_RANGE_M/2
+    S      = CAM_BEV_RANGE_M * 1000.0 / out_sz  # mm per BEV pixel
+    R_mm   = (out_sz // 2) * S                  # lateral half-range in mm
     fx     = CAL['fx']
     cx_c   = CAL['cx']
 
@@ -479,18 +480,9 @@ def render_cam_bev(rgb, depth_mm):
                 u   = uu_idx[valid].astype(np.float32)
                 v   = vv_idx[valid].astype(np.float32)
                 x   = -(u - cx_c) * z / fx
-                y   = -(v - CAL['cy']) * z / CAL['fy']
 
-                # Rotate camera-frame points to gravity-aligned world frame
-                with _imu_lock:
-                    R_imu = _imu_R.copy()
-                pts_cam = np.stack([x, y, z], axis=0)   # (3, N)
-                pts_world = R_imu @ pts_cam              # (3, N)
-                x_w = pts_world[0]                       # world lateral
-                z_w = pts_world[2]                       # world forward
-
-                bev_col = (R_mm - x_w) / S
-                bev_row = (out_sz - 1) - z_w / S
+                bev_col = (R_mm - x) / S
+                bev_row = (out_sz - 1) - z / S
 
                 inside = ((bev_col >= 0) & (bev_col < out_sz) &
                           (bev_row >= 0) & (bev_row < out_sz))
@@ -516,9 +508,9 @@ def render_cam_bev(rgb, depth_mm):
         borderMode=cv2.BORDER_CONSTANT, borderValue=(30, 30, 30))
 
     # ── Grid lines ────────────────────────────────────────────────────────
-    cells_per_m = out_sz / (2.0 * CAM_BEV_RANGE_M)
+    cells_per_m = out_sz / CAM_BEV_RANGE_M
     centre = out_sz // 2
-    for d in range(1, int(CAM_BEV_RANGE_M * 2) + 1):
+    for d in range(1, int(CAM_BEV_RANGE_M) + 1):
         ry = int(out_sz - 1 - d * cells_per_m)
         if 0 <= ry < out_sz:
             cv2.line(result, (0, ry), (out_sz - 1, ry), (55, 55, 55), 1)
