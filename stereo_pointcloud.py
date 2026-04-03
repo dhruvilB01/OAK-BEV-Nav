@@ -26,17 +26,17 @@ import numpy as np
 # ── Camera ────────────────────────────────────────────────────────────────────
 RGB_W, RGB_H  = 640, 400
 DEPTH_MIN_MM  = 300
-DEPTH_MAX_MM  = 8000
+DEPTH_MAX_MM  = 50000                # 50 m — outdoor long range
 
 # ── BEV schematic ─────────────────────────────────────────────────────────────
 BEV_W, BEV_H      = 400, 700        # pixels (width × height of output image)
-BEV_RANGE_FWD_M    = 8.0             # how far forward to show (metres)
-BEV_RANGE_SIDE_M   = 4.0             # how far left/right to show (metres)
+BEV_RANGE_FWD_M    = 15.0            # how far forward to show (metres)
+BEV_RANGE_SIDE_M   = 8.0             # how far left/right to show (metres)
 BEV_ROAD_WIDTH_M   = 6.0             # default road width if no seg (metres)
 
 # ── Camera BEV (data-driven homography warp) ─────────────────────────────────
-CAM_BEV_SIZE       = 500             # square output pixels
-CAM_BEV_RANGE_M    = 4.0             # metres from centre (forward only; side = same)
+CAM_BEV_SIZE       = 700             # square output pixels (larger for 15 m range)
+CAM_BEV_RANGE_M    = 15.0            # metres shown (robot at bottom centre)
 
 # Derived scale: pixels per metre
 _PPM_X = BEV_W / (2.0 * BEV_RANGE_SIDE_M)    # px per m, lateral
@@ -72,15 +72,25 @@ DEPTH_EMA_A   = 0.3
 def get_calibration():
     with dai.Device() as dev:
         cal = dev.readCalibration()
-        M   = cal.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, RGB_W, RGB_H)
-        ext = cal.getCameraExtrinsics(dai.CameraBoardSocket.CAM_C,
-                                      dai.CameraBoardSocket.CAM_B)
-    return dict(fx=M[0][0], fy=M[1][1], cx=M[0][2], cy=M[1][2],
-                baseline_mm=abs(np.array(ext)[0, 3] * 10))
+        M    = cal.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, RGB_W, RGB_H)
+        dist = cal.getDistortionCoefficients(dai.CameraBoardSocket.CAM_A)
+        ext  = cal.getCameraExtrinsics(dai.CameraBoardSocket.CAM_C,
+                                       dai.CameraBoardSocket.CAM_B)
+    K = np.array(M, dtype=np.float64)
+    D = np.array(dist, dtype=np.float64)
+    # Optimal undistorted camera matrix (alpha=0: no black borders)
+    K_new, _ = cv2.getOptimalNewCameraMatrix(K, D, (RGB_W, RGB_H), alpha=0)
+    return dict(
+        fx=K_new[0, 0], fy=K_new[1, 1],
+        cx=K_new[0, 2], cy=K_new[1, 2],
+        K=K, D=D, K_new=K_new,
+        baseline_mm=abs(np.array(ext)[0, 3] * 10),
+    )
 
 CAL = get_calibration()
 print(f"[cal] fx={CAL['fx']:.1f} fy={CAL['fy']:.1f} "
-      f"cx={CAL['cx']:.1f} cy={CAL['cy']:.1f}")
+      f"cx={CAL['cx']:.1f} cy={CAL['cy']:.1f} "
+      f"baseline={CAL['baseline_mm']:.1f}mm")
 
 _cal_adjusted = False
 def adjust_cal(h, w):
@@ -216,7 +226,7 @@ def _seg_worker(rgb):
     global _seg_mask, _seg_busy, _seg_mask_version
     try:
         model = _load_fastsam()
-        results = model(rgb, texts="floor", device="cpu", verbose=False, conf=0.3)
+        results = model(rgb, texts="road or sidewalk or pavement or path", device="cuda", verbose=False, conf=0.3)
         if results and results[0].masks is not None:
             m = results[0].masks.data[0].cpu().numpy().astype(np.uint8)
             m = cv2.resize(m, (rgb.shape[1], rgb.shape[0]),
@@ -228,6 +238,21 @@ def _seg_worker(rgb):
         print(f"[seg] failed: {e}")
     finally:
         _seg_busy = False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IMU — gravity-aligned rotation matrix
+# ══════════════════════════════════════════════════════════════════════════════
+_imu_lock = threading.Lock()
+_imu_R    = np.eye(3, dtype=np.float64)   # camera→world rotation (updated from BNO085)
+
+def _quat_to_rot(w, x, y, z):
+    """Unit quaternion → 3×3 rotation matrix."""
+    return np.array([
+        [1-2*(y*y+z*z),   2*(x*y-w*z),   2*(x*z+w*y)],
+        [  2*(x*y+w*z), 1-2*(x*x+z*z),   2*(y*z-w*x)],
+        [  2*(x*z-w*y),   2*(y*z+w*x), 1-2*(x*x+y*y)],
+    ], dtype=np.float64)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -248,28 +273,34 @@ def camera_thread():
     monoR.requestOutput((RGB_W, RGB_H)).link(stereo.right)
     camRgb     = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
     rgb_stream = camRgb.requestOutput((RGB_W, RGB_H), dai.ImgFrame.Type.BGR888p)
-    stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.ROBOTICS)
-    stereo.setLeftRightCheck(True)
-    stereo.setSubpixel(True)
-    stereo.setSubpixelFractionalBits(5)
-    stereo.setExtendedDisparity(False)
+    # FAST_ACCURACY: 5-bit subpixel, strict LR check (threshold=5),
+    # no decimation, no spatial/median — best accuracy for outdoor long range
+    stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.FAST_ACCURACY)
+    stereo.setExtendedDisparity(False)    # keep max range (extended = near field <1m only)
     stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
     stereo.setOutputSize(RGB_W, RGB_H)
-    stereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
     try:
         cfg = stereo.initialConfig.get()
-        cfg.postProcessing.spatialFilter.enable = True
-        cfg.postProcessing.spatialFilter.holeFillingRadius = 2
-        cfg.postProcessing.spatialFilter.numIterations = 1
+        # Temporal filter: stabilise long-range readings across frames
         cfg.postProcessing.temporalFilter.enable = True
-        cfg.postProcessing.temporalFilter.alpha = 0.2
+        cfg.postProcessing.temporalFilter.alpha = 0.4
+        # Speckle filter: remove isolated noise pixels common at range
         cfg.postProcessing.speckleFilter.enable = True
-        cfg.postProcessing.speckleFilter.speckleRange = 50
+        cfg.postProcessing.speckleFilter.speckleRange = 200
+        # Threshold filter: extend range to 50 m, clip below DEPTH_MIN
+        cfg.postProcessing.thresholdFilter.minRange = DEPTH_MIN_MM
+        cfg.postProcessing.thresholdFilter.maxRange = DEPTH_MAX_MM
         stereo.initialConfig.set(cfg)
     except Exception: pass
 
+    imu = pipeline.create(dai.node.IMU)
+    imu.enableIMUSensor(dai.IMUSensor.ROTATION_VECTOR, 100)   # BNO085 fusion @ 100 Hz
+    imu.setBatchReportThreshold(1)
+    imu.setMaxBatchReports(10)
+
     depth_q = stereo.depth.createOutputQueue(maxSize=2, blocking=False)
     rgb_q   = rgb_stream.createOutputQueue(maxSize=2, blocking=False)
+    imu_q   = imu.out.createOutputQueue(maxSize=10, blocking=False)
     with pipeline:
         pipeline.start()
         try: pipeline.setIrLaserDotProjectorIntensity(0.8)
@@ -280,9 +311,22 @@ def camera_thread():
             if df is None: continue
             raw = df.getFrame().astype(np.uint16)
             adjust_cal(raw.shape[0], raw.shape[1])
+            rgb_frame = None
+            if rf is not None:
+                frame = rf.getCvFrame()
+                rgb_frame = cv2.undistort(frame, CAL['K'], CAL['D'], None, CAL['K_new'])
             with _lock:
                 _latest_depth = smooth_depth(raw)
-                _latest_rgb   = rf.getCvFrame() if rf else None
+                _latest_rgb   = rgb_frame
+            # Update IMU rotation matrix from latest packet
+            imu_data = imu_q.tryGet()
+            if imu_data:
+                for pkt in imu_data.packets:
+                    rv = pkt.rotationVector
+                    R = _quat_to_rot(rv.real, rv.i, rv.j, rv.k)
+                    with _imu_lock:
+                        global _imu_R
+                        _imu_R = R
     _running = False
 
 
@@ -435,9 +479,18 @@ def render_cam_bev(rgb, depth_mm):
                 u   = uu_idx[valid].astype(np.float32)
                 v   = vv_idx[valid].astype(np.float32)
                 x   = -(u - cx_c) * z / fx
+                y   = -(v - CAL['cy']) * z / CAL['fy']
 
-                bev_col = (R_mm - x) / S
-                bev_row = (out_sz - 1) - z / S
+                # Rotate camera-frame points to gravity-aligned world frame
+                with _imu_lock:
+                    R_imu = _imu_R.copy()
+                pts_cam = np.stack([x, y, z], axis=0)   # (3, N)
+                pts_world = R_imu @ pts_cam              # (3, N)
+                x_w = pts_world[0]                       # world lateral
+                z_w = pts_world[2]                       # world forward
+
+                bev_col = (R_mm - x_w) / S
+                bev_row = (out_sz - 1) - z_w / S
 
                 inside = ((bev_col >= 0) & (bev_col < out_sz) &
                           (bev_row >= 0) & (bev_row < out_sz))
